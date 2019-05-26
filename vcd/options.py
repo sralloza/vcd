@@ -15,7 +15,7 @@ class Options:
     _CONFIG_PATH = os.path.expanduser('~') + '/vcd-config.ini'
     PRODUCTION = False
     FILENAME_PATTERN = re.compile('filename=\"?([\w. ]*)\"?')
-    ROOT_FOLDER = 'D:/sistema/desktop/virtual_ittade3'
+    ROOT_FOLDER = 'D:/sistema/desktop/-vi3'
     TIMEOUT = 30
 
     @staticmethod

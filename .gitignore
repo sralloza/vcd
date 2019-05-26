@@ -2,9 +2,8 @@
 venv/
 vlogs/
 __pycache__/
-vcd/analysis.py
-vcd/performance.py
 logs/
+
 *.bat
 *.log
 *.cmd
@@ -12,3 +11,4 @@ logs/
 *.json
 *.csv
 *.ini
+*.txt

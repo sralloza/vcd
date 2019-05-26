@@ -1,21 +1,22 @@
 """File downloader for the Virtual Campus of the Valladolid Unversity."""
+
+import asyncio
 import logging
 import os
 import time
-from logging.handlers import RotatingFileHandler
-from queue import Queue
-from threading import current_thread
 
 from bs4 import BeautifulSoup
 from colorama import init, Fore
+from logging.handlers import RotatingFileHandler
+from threading import current_thread
 
 from ._requests import Downloader
-from ._threading import start_workers
+from ._threading import run
 from .credentials import Credentials
 from .options import Options
-from .status_server import runserver
 from .subject import Subject
 from .time_operations import seconds_to_str
+
 
 if os.path.isdir('logs') is False:
     os.mkdir('logs')
@@ -23,7 +24,7 @@ if os.path.isdir('logs') is False:
 if os.environ.get('TESTING') is None:
     should_roll_over = os.path.isfile('logs/vcd.log')
 
-    old_reliable = "[%(asctime)s] %(levelname)s - %(threadName)s.%(module)s:%(lineno)s - %(message)s"
+    fmt = "[%(asctime)s] %(levelname)s - %(threadName)s.%(module)s:%(lineno)s - %(message)s"
     handler = RotatingFileHandler(filename='logs/vcd.log', maxBytes=2_500_000,
                                   encoding='utf-8', backupCount=5)
 
@@ -32,7 +33,7 @@ if os.environ.get('TESTING') is None:
     if should_roll_over:
         handler.doRollover()
 
-    logging.basicConfig(handlers=[handler, ], level=logging.DEBUG, format=old_reliable)
+    logging.basicConfig(handlers=[handler, ], level=logging.DEBUG, format=fmt)
 
 logging.getLogger('urllib3').setLevel(logging.ERROR)
 
@@ -40,13 +41,17 @@ logger = logging.getLogger(__name__)
 
 
 # noinspection PyShadowingNames
-def find_subjects(downloader, queue, nthreads=20):
+
+async def find_subjects():
+    async with Downloader() as downloader:
+        await _find_subjects(downloader)
+
+
+async def _find_subjects(downloader):
     """Starts finding subjects.
 
     Args:
         downloader (Downloader): custom session with retry control.
-        queue (Queue): queue to organize threads.
-        nthreads (int): number of threads to start.
 
     Returns:
 
@@ -54,25 +59,25 @@ def find_subjects(downloader, queue, nthreads=20):
     logger = logging.getLogger(__name__)
     logger.debug('Finding subjects')
 
-    threads = start_workers(queue, nthreads)
-    runserver(queue, threads)
 
     user = Credentials.get()
 
-    downloader.post(
+    await downloader.post(
         'https://campusvirtual.uva.es/login/index.php',
         data={'anchor': '', 'username': user.username, 'password': user.password})
 
-    response = downloader.get('https://campusvirtual.uva.es/my/')
+    response = await downloader.get('https://campusvirtual.uva.es/my/')
 
-    logger.debug('Returned primary response with code %d', response.status_code)
+    logger.debug('Returned primary response with code %d', response.status)
 
-    logger.debug('Login correct: %s', 'Vista general de cursos' in response.text)
+    response_text = await response.text()
 
-    if 'Vista general de cursos' not in response.text:
+    logger.debug('Login correct: %s', 'Vista general de cursos' in response_text)
+
+    if 'Vista general de cursos' not in response_text:
         exit(Fore.RED + 'Login not correct' + Fore.RESET)
 
-    soup = BeautifulSoup(response.content, 'html.parser')
+    soup = BeautifulSoup(response_text, 'html.parser')
     search = soup.findAll('div', {'class': 'course_title'})
 
     logger.debug('Found %d potential subjects', len(search))
@@ -86,12 +91,16 @@ def find_subjects(downloader, queue, nthreads=20):
             continue
 
         logger.debug('Assembling subject %r', name)
-        subjects.append(Subject(name, subject_url, downloader, queue))
+        subjects.append(Subject(name, subject_url, downloader))
 
     subjects.sort(key=lambda x: x.name)
 
     for i, _ in enumerate(subjects):
-        queue.put(subjects[i])
+        await run(subjects[i])
+
+    for subject in subjects:
+        for link in subject.notes_links:
+            await run(link)
 
     return subjects
 
@@ -109,16 +118,9 @@ def start(root_folder=None, nthreads=50, timeout=None):
     initial_time = time.time()
     main_logger = logging.getLogger(__name__)
     main_logger.info('STARTING APP')
-    main_logger.debug('Starting downloader')
-    downloader = Downloader()
-    main_logger.debug('Starting queue')
-    queue = Queue()
 
     main_logger.debug('Launching subjects finder')
-    find_subjects(downloader, queue, nthreads)
-
-    main_logger.debug('Waiting for queue to empty')
-    queue.join()
+    asyncio.run(find_subjects())
 
     final_time = time.time() - initial_time
     main_logger.info('VCD executed in %s', seconds_to_str(final_time))

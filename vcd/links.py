@@ -3,22 +3,16 @@ import logging
 import os
 import random
 import warnings
-from _sha1 import sha1
-from queue import Queue
 
+from _sha1 import sha1
 from bs4 import BeautifulSoup
 from requests import Response
 
-from vcd._requests import Downloader
-from vcd.alias import Alias
-from vcd.filecache import REAL_FILE_CACHE
-from vcd.results import Results
+from ._requests import Downloader
+from .alias import Alias
+from .filecache import REAL_FILE_CACHE
 from .options import Options
-
-
-# pylint: disable=too-many-instance-attributes
-# pylint: disable=too-many-arguments
-# pylint: disable=too-many-return-statements
+from .results import Results
 
 
 class DownloadsRecorder:
@@ -33,48 +27,31 @@ class DownloadsRecorder:
 class BaseLink:
     """Base class for Links."""
 
-    def __init__(self, name, url, subject, downloader, queue):
+    def __init__(self, name, url, subject, downloader):
         """
         Args:
             name (str): name of the url.
             url (str): URL of the url.
             subject (vcd.subject.Subject): subject of the url.
             downloader (vcd.requests.Downloader): downloader to download resources.
-            queue (Queue): queue to controll threads.
         """
 
         self.name = name
         self.url = url
         self.subject = subject
         self.downloader = downloader
-        self.queue = queue
 
         self.response: Response = None
         self.soup: BeautifulSoup = None
         self.filepath: str = None
-        self.method = 'GET'
-        self.post_data = None
         self.redirect_url = None
         self.subfolder = None
         self.response_name = None
+        self.response_content = None
 
         self.logger = logging.getLogger(__name__)
         self.logger.debug('Created %s(name=%r, url=%r, subject=%r)',
                           self.__class__.__name__, self.name, self.url, self.subject.name)
-
-    def set_post_data(self, value):
-        """Sets the post data.
-
-        Args:
-            value (dict): post data.
-
-        """
-        self.logger.debug('Set post data: %r (%r)', value, self.name)
-
-        if not isinstance(value, dict):
-            raise TypeError(f'Expected dict, not {type(value).__name__}')
-
-        self.post_data = value
 
     def set_subfolder(self, value):
         """Sets the subfolder.
@@ -168,41 +145,28 @@ class BaseLink:
         """Creates the subject's principal folder."""
         return self.subject.create_folder()
 
-    def make_request(self):
+    async def make_request(self):
         """Makes the request for the Link."""
 
         self.logger.debug('Making request')
 
-        if self.method is None:
-            raise NotImplementedError
-        elif self.method == 'GET':
-            self.response = self.downloader.get(self.redirect_url or self.url,
-                                                timeout=Options.TIMEOUT)
+        self.response = await self.downloader.get(
+            self.redirect_url or self.url,
+            timeout=Options.TIMEOUT)
 
-        elif self.method == 'POST':
-            self.response = self.downloader.post(self.redirect_url or self.url, data=self.post_data,
-                                                 timeout=Options.TIMEOUT)
-        else:
-            raise RuntimeError(f'Invalid method: {self.method}')
+        self.logger.debug('Response obtained [%d]', self.response.status)
 
-        self.logger.debug('Response obtained (%s | %s) [%d]', self.method,
-                          self.response.request.method, self.response.status_code)
+        self.response_content = await self.response.read()
 
-        if self.response.status_code == 408:
+        if self.response.status == 408:
             self.logger.warning('Received response with code 408, retrying')
-            return self.make_request()
+            return await self.make_request()
 
-    def close_connection(self):
-        warnings.warn('Since streams are not used, this method should not be called',
-                      DeprecationWarning)
-        self.logger.debug('Closing connection')
-        self.response.close()
-
-    def process_request_bs4(self):
+    async def process_request_bs4(self):
         """Parses the response with BeautifulSoup with the html parser."""
 
         self.logger.debug('Parsing response (bs4)')
-        self.soup = BeautifulSoup(self.response.text, 'html.parser')
+        self.soup = BeautifulSoup(await self.response.text(), 'html.parser')
         self.logger.debug('Response parsed (bs4)')
 
     def autoset_filepath(self):
@@ -228,7 +192,7 @@ class BaseLink:
 
         self.logger.debug('Set filepath: %r', self.filepath)
 
-    def download(self):
+    async def download(self):
         """Abstract method to download the Link. Must be overridden by subclasses."""
         self.logger.debug('Called download() but it was not implemented')
         raise NotImplementedError
@@ -237,7 +201,7 @@ class BaseLink:
         try:
             return int(self.response.headers['Content-Length'])
         except KeyError:
-            return len(self.response.content)
+            return len(self.response_content)
 
     @property
     def content_type(self):
@@ -258,22 +222,22 @@ class BaseLink:
         if self.filepath in REAL_FILE_CACHE:
             if REAL_FILE_CACHE[self.filepath] == self.get_header_length():
                 self.logger.debug('File found in cache: Same content (%d)',
-                                  len(self.response.content))
+                                  len(self.response_content))
                 # self.close_connection()
                 return
 
             self.logger.debug('File found in cache: Different content (%d --> %d)',
-                              REAL_FILE_CACHE[self.filepath], len(self.response.content))
+                              REAL_FILE_CACHE[self.filepath], len(self.response_content))
             Results.print_updated(f'File updated: {self.filepath}')
         else:
             self.logger.debug('File added to cache: %s [%d]', self.filepath,
-                              len(self.response.content))
-            REAL_FILE_CACHE[self.filepath] = len(self.response.content)
+                              len(self.response_content))
+            REAL_FILE_CACHE[self.filepath] = len(self.response_content)
             Results.print_new(f'New file: {self.filepath}')
 
         try:
             with open(self.filepath, 'wb') as file_handler:
-                file_handler.write(self.response.content)
+                file_handler.write(self.response_content)
             self.logger.debug('File downloaded and saved: %s', self.filepath)
             DownloadsRecorder.write('Downloaded %s -- %s', self.subject.name,
                                     os.path.basename(self.filepath))
@@ -288,11 +252,11 @@ class BaseLink:
 class Resource(BaseLink):
     """Representation of a resource."""
 
-    def __init__(self, name, url, subject, downloader: Downloader, queue: Queue):
-        super().__init__(name, url, subject, downloader, queue)
+    def __init__(self, name, url, subject, downloader: Downloader):
+        super().__init__(name, url, subject, downloader)
         self.resource_type = 'unknown'
 
-    def set_resource_type(self, new):
+    async def set_resource_type(self, new):
         """Sets a new resource type.
 
         Args:
@@ -302,131 +266,131 @@ class Resource(BaseLink):
         self.resource_type = new
 
         if self.resource_type == 'html':
-            self.process_request_bs4()
+            await self.process_request_bs4()
 
-    def download(self):
+    async def download(self):
         """Downloads the resource."""
         self.logger.debug('Downloading resource %s', self.name)
-        self.make_request()
+        await self.make_request()
 
-        if self.response.status_code == 404:
+        if self.response.status == 404:
             self.logger.error('status code of 404 in url %r [%r]', self.url, self.name)
             return None
 
         if 'application/pdf' in self.content_type:
-            self.set_resource_type('pdf')
+            await self.set_resource_type('pdf')
             return self.save_response_content()
 
         if 'officedocument.wordprocessingml.document' in self.content_type:
-            self.set_resource_type('word')
+            await self.set_resource_type('word')
             return self.save_response_content()
 
         if 'officedocument.spreadsheetml.sheet' in self.content_type:
-            self.set_resource_type('excel')
+            await self.set_resource_type('excel')
             return self.save_response_content()
 
         if 'officedocument.presentationml.slideshow' in self.content_type:
-            self.set_resource_type('power-point')
+            await self.set_resource_type('power-point')
             return self.save_response_content()
 
         if 'presentationml.presentation' in self.content_type:
-            self.set_resource_type('power-point')
+            await self.set_resource_type('power-point')
             return self.save_response_content()
 
         if 'powerpoint' in self.content_type:
-            self.set_resource_type('power-point')
+            await self.set_resource_type('power-point')
             return self.save_response_content()
 
         if 'msword' in self.content_type:
-            self.set_resource_type('word')
+            await self.set_resource_type('word')
             return self.save_response_content()
 
         if 'application/zip' in self.content_type:
-            self.set_resource_type('zip')
+            await self.set_resource_type('zip')
             return self.save_response_content()
 
         if 'application/g-zip' in self.content_type:
-            self.set_resource_type('gzip')
+            await self.set_resource_type('gzip')
             return self.save_response_content()
 
         if 'application/x-7z-compressed' in self.content_type:
-            self.set_resource_type('7zip')
+            await self.set_resource_type('7zip')
             return self.save_response_content()
 
         if 'x-rar-compressed' in self.content_type:
-            self.set_resource_type('rar')
+            await self.set_resource_type('rar')
             return self.save_response_content()
 
         if 'text/plain' in self.content_type:
-            self.set_resource_type('plain')
+            await self.set_resource_type('plain')
             return self.save_response_content()
 
         if 'application/json' in self.content_type:
-            self.set_resource_type('json')
+            await self.set_resource_type('json')
             return self.save_response_content()
 
         if 'application/octet-stream' in self.content_type:
-            self.set_resource_type('octect-stream')
+            await self.set_resource_type('octect-stream')
             return self.save_response_content()
 
         if 'image/jpeg' in self.content_type:
-            self.set_resource_type('jpeg')
+            await self.set_resource_type('jpeg')
             return self.save_response_content()
 
         if 'image/png' in self.content_type:
-            self.set_resource_type('png')
+            await self.set_resource_type('png')
             return self.save_response_content()
 
         if 'video/mp4' in self.content_type:
-            self.set_resource_type('mp4')
+            await self.set_resource_type('mp4')
             return self.save_response_content()
 
         if 'video/x-ms-wm' in self.content_type:
-            self.set_resource_type('avi')
+            await self.set_resource_type('avi')
             return self.save_response_content()
 
         if 'text/html' in self.content_type:
-            self.set_resource_type('html')
-            return self.parse_html()
+            await self.set_resource_type('html')
+            return await self.parse_html()
 
-        if self.response.status_code % 300 < 100:
+        if self.response.status % 300 < 100:
             self.url = self.response.headers['Location']
             self.logger.warning('Redirecting to %r', self.url)
-            return self.download()
+            return await self.download()
 
         self.logger.error('Content not identified: %r (code=%s, header=%r)',
-                          self.url, self.response.status_code, self.response.headers)
+                          self.url, self.response.status, self.response.headers)
         return None
 
-    def parse_html(self):
+    async def parse_html(self):
         """Parses a HTML response."""
-        self.set_resource_type('html')
+        await self.set_resource_type('html')
         self.logger.debug('Parsing HTML (%r)', self.url)
         resource = self.soup.find('object', {'id': 'resourceobject'})
         name = self.soup.find('div', {'role': 'main'}).h2.text
 
         try:
-            resource = Resource(name, resource['data'], self.subject, self.downloader, self.queue)
+            resource = Resource(name, resource['data'], self.subject, self.downloader)
             self.logger.debug('Created resource from HTML: %r, %s', resource.name, resource.url)
-            self.subject.queue.put(resource)
+            self.subject.notes_links.append(resource)
             return
         except TypeError:
             pass
 
         try:
             resource = self.soup.find('iframe', {'id': 'resourceobject'})
-            resource = Resource(name, resource['src'], self.subject, self.downloader, self.queue)
+            resource = Resource(name, resource['src'], self.subject, self.downloader)
             self.logger.debug('Created resource from HTML: %r, %s', resource.name, resource.url)
-            self.subject.queue.put(resource)
+            self.subject.notes_links.append(resource)
             return
         except TypeError:
             pass
 
         try:
             resource = self.soup.find('div', {'class': 'resourceworkaround'})
-            resource = Resource(name, resource.a['href'], self.subject, self.downloader, self.queue)
+            resource = Resource(name, resource.a['href'], self.subject, self.downloader)
             self.logger.debug('Created resource from HTML: %r, %s', resource.name, resource.url)
-            self.subject.queue.put(resource)
+            self.subject.notes_links.append(resource)
             return
         except TypeError:
             random_name = str(random.randint(0, 1000))
@@ -435,7 +399,7 @@ class Resource(BaseLink):
             self.logger.error('ERROR HEADS: %s', self.response.headers)
 
             with open(random_name + '.html', 'wb') as file_handler:
-                file_handler.write(self.response.content)
+                file_handler.write(self.response_content)
 
 
 class Folder(BaseLink):
@@ -447,11 +411,11 @@ class Folder(BaseLink):
         self.create_subject_folder()
         self.create_subfolder()
 
-    def download(self):
+    async def download(self):
         """Downloads the folder."""
         self.logger.debug('Downloading folder %s', self.name)
-        self.make_request()
-        self.process_request_bs4()
+        await self.make_request()
+        await self.process_request_bs4()
         self.make_folder()
 
         containers = self.soup.findAll('span', {'class': 'fp-filename-icon'})
@@ -460,11 +424,11 @@ class Folder(BaseLink):
             try:
                 url = container.a['href']
                 resource = Resource(os.path.splitext(container.a.text)[0],
-                                    url, self.subject, self.downloader, self.queue)
+                                    url, self.subject, self.downloader)
                 resource.set_subfolder(self.name)
                 self.logger.debug('Created resource from folder: %r, %s',
                                   resource.name, resource.url)
-                self.queue.put(resource)
+                self.subject.notes_links.append(resource)
 
             except TypeError:
                 continue
@@ -473,21 +437,20 @@ class Folder(BaseLink):
 class Forum(BaseLink):
     """Representation of a Forum link."""
 
-    def download(self):
+    async def download(self):
         """Downloads the resources found in the forum hierarchy."""
         self.logger.debug('Downloading forum %s', self.name)
-        self.make_request()
-        self.process_request_bs4()
+        await self.make_request()
+        await self.process_request_bs4()
 
         if 'view.php' in self.url:
             self.logger.debug('Forum is type list of themes')
             themes = self.soup.findAll('td', {'class': 'topic starter'})
 
             for theme in themes:
-                forum = Forum(theme.text, theme.a['href'], self.subject, self.downloader,
-                              self.queue)
+                forum = Forum(theme.text, theme.a['href'], self.subject, self.downloader)
                 self.logger.debug('Created forum from forum: %r, %s', forum.name, forum.url)
-                self.queue.put(forum)
+                self.subject.notes_links.append(forum)
 
         elif 'discuss.php' in self.url:
             self.logger.debug('Forum is a theme discussion')
@@ -496,10 +459,10 @@ class Forum(BaseLink):
             for attachment in attachments:
                 try:
                     resource = Resource(os.path.splitext(attachment.text)[0], attachment.a['href'],
-                                        self.subject, self.downloader, self.queue)
+                                        self.subject, self.downloader)
                     self.logger.debug('Created resource from forum: %r, %s', resource.name,
                                       resource.url)
-                    self.queue.put(resource)
+                    self.subject.notes_links.append(resource)
                 except TypeError:
                     continue
         else:
@@ -516,11 +479,11 @@ class Delivery(BaseLink):
         self.create_subject_folder()
         self.create_subfolder()
 
-    def download(self):
+    async def download(self):
         """Downloads the resources found in the delivery."""
         self.logger.debug('Downloading delivery %s', self.name)
-        self.make_request()
-        self.process_request_bs4()
+        await self.make_request()
+        await self.process_request_bs4()
         self.make_subfolder()
 
         links = []
@@ -528,7 +491,7 @@ class Delivery(BaseLink):
 
         for container in containers:
             resource = Resource(os.path.splitext(container.text)[0], container['href'],
-                                self.subject, self.downloader, self.queue)
+                                self.subject, self.downloader)
             resource.set_subfolder(self.subfolder)
 
             self.logger.debug('Created resource from delivery: %r, %s', resource.name,
@@ -548,4 +511,4 @@ class Delivery(BaseLink):
                     self.logger.debug('Changed name %r -> %r', name, links[i].name)
 
         for link in links:
-            self.queue.put(link)
+            self.subject.notes_links.append(link)

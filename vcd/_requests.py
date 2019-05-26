@@ -2,8 +2,8 @@
 
 """Custom downloader with retries control."""
 
+import aiohttp
 import logging
-
 import requests
 
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 '
@@ -14,7 +14,7 @@ class DownloaderError(Exception):
     """Error while downloading."""
 
 
-class Downloader(requests.Session):
+class Downloader(aiohttp.ClientSession):
     """Downloader with retries control."""
 
     def __init__(self, retries=10, silenced=False):
@@ -26,13 +26,13 @@ class Downloader(requests.Session):
         self._retries = retries
         super().__init__()
 
-    def get(self, url, **kwargs):
+    async def get(self, url, **kwargs):
         self.logger.debug('GET %r', url)
         retries = self._retries
 
         while retries > 0:
             try:
-                return super().get(url, **kwargs)
+                return await super().get(url, **kwargs)
             except requests.exceptions.ConnectionError:
                 retries -= 1
                 self.logger.warning('Connection error in GET, retries=%s', retries)
@@ -43,13 +43,13 @@ class Downloader(requests.Session):
         self.logger.critical('Download error in GET %r', url)
         raise DownloaderError('max retries failed.')
 
-    def post(self, url, data=None, json=None, **kwargs):
+    async def post(self, url, data=None, json=None, **kwargs):
         self.logger.debug('POST %r', url)
         retries = self._retries
 
         while retries > 0:
             try:
-                return super().post(url=url, data=data, json=json, **kwargs)
+                return await super().post(url=url, data=data, json=json, **kwargs)
             except requests.exceptions.ConnectionError:
                 retries -= 1
                 self.logger.warning('Connection error in POST, retries=%s', retries)

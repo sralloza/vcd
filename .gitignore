@@ -4,6 +4,7 @@ __pycache__/
 vcd/analysis.py
 vcd/performance.py
 logs/
+.idea/
 
 *.bat
 *.log
